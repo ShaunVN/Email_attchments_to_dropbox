@@ -2,23 +2,33 @@ import imaplib
 import os
 from email import message_from_bytes
 from email.header import decode_header
+from email.utils import parseaddr
 
-import dropbox
-from dropbox.exceptions import ApiError
 from dotenv import load_dotenv
+
+try:
+    import dropbox
+    from dropbox.exceptions import ApiError
+except ImportError:  # pragma: no cover
+    dropbox = None
+    ApiError = None
 
 load_dotenv()
 
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
+LOCAL_DEST_FOLDER = os.getenv(
+    "LOCAL_DEST_FOLDER",
+    r"C:\Users\shaun\Dropbox\Personal\Home Buying\85_1 Mark St Lidcombe\HSBC\Loan statements",
+)
 DROPBOX_DEST_FOLDER = os.getenv("DROPBOX_DEST_FOLDER", "/Email_Attachments")
-SEARCH_CRITERIA = os.getenv("SEARCH_CRITERIA", 'UNSEEN SUBJECT "Invoice"')
-ALLOWED_EXTENSIONS = {
-    ext.strip().lower()
-    for ext in os.getenv("ALLOWED_EXTENSIONS", ".pdf,.xlsx,.csv,.png,.jpg").split(",")
-    if ext.strip()
-}
+SEARCH_CRITERIA = os.getenv(
+    "SEARCH_CRITERIA",
+    'FROM "HSBC@connect.hsbc.com.au" SUBJECT "Your Monthly HSBC Bank Statement" UNSEEN',
+)
+TARGET_SENDER = "HSBC@connect.hsbc.com.au".lower()
+TARGET_SUBJECT = "Your Monthly HSBC Bank Statement".lower()
 
 
 def connect_gmail():
@@ -32,8 +42,23 @@ def connect_gmail():
     return mail
 
 
+def decode_header_value(value):
+    if not value:
+        return ""
+
+    decoded_parts = decode_header(value)
+    text = "".join(
+        part.decode(charset or "utf-8", errors="replace") if isinstance(part, bytes) else part
+        for part, charset in decoded_parts
+    )
+    return text
+
+
 def upload_to_dropbox(dbx, file_bytes, dropbox_path):
-    """Upload byte content directly to Dropbox."""
+    """Upload byte content directly to Dropbox when configured."""
+    if dropbox is None or ApiError is None:
+        return
+
     try:
         dbx.files_upload(file_bytes, dropbox_path, mode=dropbox.files.WriteMode.overwrite)
         print(f"Successfully uploaded: {dropbox_path}")
@@ -41,21 +66,21 @@ def upload_to_dropbox(dbx, file_bytes, dropbox_path):
         print(f"Failed to upload {dropbox_path}: {err}")
 
 
-def decode_filename(filename):
-    if not filename:
-        return ""
+def save_attachment_locally(file_bytes, filename, target_folder):
+    os.makedirs(target_folder, exist_ok=True)
+    destination = os.path.join(target_folder, filename)
+    with open(destination, "wb") as output_file:
+        output_file.write(file_bytes)
+    print(f"Saved attachment: {destination}")
 
-    decoded_name, encoding = decode_header(filename)[0]
-    if isinstance(decoded_name, bytes):
-        return decoded_name.decode(encoding or "utf-8", errors="replace")
-    return decoded_name
+
+def is_expected_email(msg):
+    from_address = parseaddr(msg.get("From", ""))[1].lower()
+    subject = decode_header_value(msg.get("Subject", "")).lower()
+    return from_address == TARGET_SENDER and subject == TARGET_SUBJECT
 
 
 def process_emails():
-    if not DROPBOX_ACCESS_TOKEN:
-        raise ValueError("Set DROPBOX_ACCESS_TOKEN in your environment or .env file.")
-
-    dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
     mail = connect_gmail()
 
     try:
@@ -65,10 +90,17 @@ def process_emails():
 
         email_ids = messages[0].split()
         if not email_ids:
-            print("No matching emails found.")
+            print("No matching HSBC emails found.")
             return
 
-        print(f"Found {len(email_ids)} email(s) matching criteria.")
+        print(f"Found {len(email_ids)} HSBC email(s) matching the criteria.")
+
+        if DROPBOX_ACCESS_TOKEN and dropbox is not None:
+            dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+        else:
+            dbx = None
+            os.makedirs(LOCAL_DEST_FOLDER, exist_ok=True)
+            print(f"Saving HSBC PDF statements to: {LOCAL_DEST_FOLDER}")
 
         for email_id in email_ids:
             _, msg_data = mail.fetch(email_id, "(RFC822)")
@@ -77,6 +109,10 @@ def process_emails():
                     continue
 
                 msg = message_from_bytes(response_part[1])
+                if not is_expected_email(msg):
+                    print(f"Skipping email not matching HSBC statement criteria: {msg.get('Subject')}")
+                    continue
+
                 for part in msg.walk():
                     if part.get_content_maintype() == "multipart":
                         continue
@@ -87,20 +123,21 @@ def process_emails():
                     if not filename:
                         continue
 
-                    filename = decode_filename(filename)
-                    extension = os.path.splitext(filename)[1].lower()
-
-                    if ALLOWED_EXTENSIONS and extension not in ALLOWED_EXTENSIONS:
-                        print(f"Skipping {filename} (unsupported extension: {extension})")
+                    filename = decode_header_value(filename)
+                    if not filename.lower().endswith(".pdf"):
+                        print(f"Skipping {filename} (not a PDF attachment)")
                         continue
 
                     file_bytes = part.get_payload(decode=True)
-                    if not file_bytes:
+                    if file_bytes is None:
                         continue
 
-                    dropbox_path = f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{filename}"
-                    print(f"Processing attachment: {filename}")
-                    upload_to_dropbox(dbx, file_bytes, dropbox_path)
+                    if dbx is not None:
+                        dropbox_path = f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{filename}"
+                        print(f"Processing HSBC PDF attachment: {filename}")
+                        upload_to_dropbox(dbx, file_bytes, dropbox_path)
+                    else:
+                        save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER)
     finally:
         mail.logout()
 
