@@ -1,3 +1,13 @@
+"""
+Email attachment automation for HSBC monthly statements.
+Features added:
+- Persistent processed hashes to avoid duplicates across runs
+- --dry-run flag to preview actions without modifying emails or files
+- Inline comments and clearer structure for maintainability
+- State stored in processed_statements.json with keys: last_processed_date, processed_hashes
+"""
+
+import argparse
 import hashlib
 import json
 import imaplib
@@ -9,6 +19,7 @@ from email.utils import parsedate_to_datetime, parseaddr
 
 from dotenv import load_dotenv
 
+# Dropbox SDK is optional; script works in local-only mode when missing
 try:
     import dropbox
     from dropbox.exceptions import ApiError
@@ -18,6 +29,7 @@ except ImportError:  # pragma: no cover
 
 load_dotenv()
 
+# ---------- Configuration (loaded from environment or .env) ----------
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
@@ -27,7 +39,9 @@ LOCAL_DEST_FOLDER = os.getenv(
 )
 DROPBOX_DEST_FOLDER = os.getenv("DROPBOX_DEST_FOLDER", "/Email_Attachments")
 GMAIL_HOMELOANS_FOLDER = os.getenv("GMAIL_HOMELOANS_FOLDER", "HomeLoans")
+# LAST_PROCESSED_DATE is optional override; persisted state will take precedence
 LAST_PROCESSED_DATE = os.getenv("LAST_PROCESSED_DATE", "")
+# STATE_FILE stores JSON with 'last_processed_date' and 'processed_hashes' list
 STATE_FILE = os.getenv("STATE_FILE", "processed_statements.json")
 SEARCH_CRITERIA = os.getenv(
     "SEARCH_CRITERIA",
@@ -37,18 +51,21 @@ TARGET_SENDER = "HSBC@connect.hsbc.com.au".lower()
 TARGET_SUBJECT = "Your Monthly HSBC Bank Statement".lower()
 
 
+# ---------- Helpers: IMAP connection and header decoding ----------
 def connect_gmail():
-    """Connect to Gmail via IMAP."""
+    """Connect to Gmail via IMAP using credentials from env/.env."""
     if not GMAIL_USER or not GMAIL_APP_PASSWORD:
         raise ValueError("Set GMAIL_USER and GMAIL_APP_PASSWORD in your environment or .env file.")
 
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
     mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+    # Select the inbox mailbox; adjust if you need a different mailbox
     mail.select("inbox")
     return mail
 
 
 def decode_header_value(value):
+    """Decode an RFC-2047 encoded header into a unicode string."""
     if not value:
         return ""
 
@@ -61,6 +78,7 @@ def decode_header_value(value):
 
 
 def normalize_datetime(value):
+    """Parse an email Date header into a datetime or return None."""
     if not value:
         return None
     try:
@@ -69,31 +87,46 @@ def normalize_datetime(value):
         return None
 
 
+# ---------- Persistent state (checkpoint + processed hashes) ----------
 def load_processed_state():
+    """Load the processing state from STATE_FILE.
+
+    The state JSON has the shape:
+      {
+        "last_processed_date": "<iso timestamp>" or "",
+        "processed_hashes": ["sha256hex", ...]
+      }
+    """
+    default = {"last_processed_date": LAST_PROCESSED_DATE, "processed_hashes": []}
     if not os.path.exists(STATE_FILE):
-        return {"last_processed_date": LAST_PROCESSED_DATE}
+        return default
 
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as state_file:
             state = json.load(state_file)
     except (json.JSONDecodeError, OSError):
-        return {"last_processed_date": LAST_PROCESSED_DATE}
+        return default
 
-    if "last_processed_date" not in state and LAST_PROCESSED_DATE:
-        state["last_processed_date"] = LAST_PROCESSED_DATE
+    # Ensure keys exist
+    state.setdefault("last_processed_date", LAST_PROCESSED_DATE)
+    state.setdefault("processed_hashes", [])
     return state
 
 
 def save_processed_state(state):
+    """Persist the processing state to STATE_FILE."""
     with open(STATE_FILE, "w", encoding="utf-8") as state_file:
         json.dump(state, state_file, indent=2)
 
 
 def file_hash(file_bytes):
+    """Return SHA-256 hex digest for bytes — used to detect duplicate attachments."""
     return hashlib.sha256(file_bytes).hexdigest()
 
 
+# ---------- Gmail label/folder management helpers ----------
 def ensure_gmail_home_loans_folder(mail):
+    """Ensure the HomeLoans label/folder exists in the account; create if missing."""
     status, folder_data = mail.list()
     if status != "OK":
         raise RuntimeError(f"Failed to list Gmail folders: {status}")
@@ -101,40 +134,68 @@ def ensure_gmail_home_loans_folder(mail):
     folder_name = f'"{GMAIL_HOMELOANS_FOLDER}"'
     for entry in folder_data or []:
         if folder_name.encode("utf-8") in entry or GMAIL_HOMELOANS_FOLDER.encode("utf-8") in entry:
+            # Found existing folder/label
             return
 
+    # Create the label (IMAP CREATE). If it fails, we'll continue but print a warning.
     result = mail.create(GMAIL_HOMELOANS_FOLDER)
     if result[0] != "OK":
         print(f"Could not create Gmail label/folder '{GMAIL_HOMELOANS_FOLDER}'")
 
 
 def move_email_to_home_loans(mail, email_id):
+    """Move a message out of Inbox into the HomeLoans label and mark it seen/deleted.
+
+    Implemented as: mark seen -> copy to label -> mark deleted -> expunge
+    This is a standard IMAP move pattern.
+    """
+    # Mark as seen
     mail.store(email_id, "+FLAGS", "(\\Seen)")
+    # Copy to HomeLoans label
     mail.copy(email_id, GMAIL_HOMELOANS_FOLDER)
+    # Mark original for deletion and expunge to remove from Inbox
     mail.store(email_id, "+FLAGS", "\\Deleted")
     mail.expunge()
-    print(f"Moved email {email_id.decode()} to folder/label '{GMAIL_HOMELOANS_FOLDER}' and marked as read.")
+    try:
+        print(f"Moved email {email_id.decode()} to folder/label '{GMAIL_HOMELOANS_FOLDER}' and marked as read.")
+    except Exception:
+        # email_id may already be a string in some contexts
+        print(f"Moved email {email_id} to folder/label '{GMAIL_HOMELOANS_FOLDER}' and marked as read.")
 
 
-def upload_to_dropbox(dbx, file_bytes, dropbox_path):
-    """Upload byte content directly to Dropbox when configured."""
+# ---------- Dropbox/local save helpers ----------
+def upload_to_dropbox(dbx, file_bytes, dropbox_path, dry_run=False):
+    """Upload byte content directly to Dropbox when configured. In dry-run, only print."""
+    if dry_run:
+        print(f"[dry-run] Would upload to Dropbox: {dropbox_path}")
+        return True
+
     if dropbox is None or ApiError is None:
-        return
+        print("Dropbox SDK not available; skipping upload.")
+        return False
 
     try:
         dbx.files_upload(file_bytes, dropbox_path, mode=dropbox.files.WriteMode.overwrite)
         print(f"Successfully uploaded: {dropbox_path}")
+        return True
     except ApiError as err:
         print(f"Failed to upload {dropbox_path}: {err}")
+        return False
 
 
-def save_attachment_locally(file_bytes, filename, target_folder, seen_hashes):
+def save_attachment_locally(file_bytes, filename, target_folder, processed_hashes, dry_run=False):
+    """Save attachment to local folder if not duplicate. Returns True if saved."""
     file_digest = file_hash(file_bytes)
-    if file_digest in seen_hashes:
+    if file_digest in processed_hashes:
         print(f"Skipping duplicate HSBC statement: {filename}")
         return False
 
-    seen_hashes.add(file_digest)
+    if dry_run:
+        print(f"[dry-run] Would save: {os.path.join(target_folder, filename)}")
+        return True
+
+    # Record the hash and write file
+    processed_hashes.add(file_digest)
     os.makedirs(target_folder, exist_ok=True)
     destination = os.path.join(target_folder, filename)
     with open(destination, "wb") as output_file:
@@ -143,13 +204,16 @@ def save_attachment_locally(file_bytes, filename, target_folder, seen_hashes):
     return True
 
 
+# ---------- Email/message helpers ----------
 def is_expected_email(msg):
+    """Return True when message sender and subject match the HSBC statement pattern."""
     from_address = parseaddr(msg.get("From", ""))[1].lower()
     subject = decode_header_value(msg.get("Subject", "")).lower()
     return from_address == TARGET_SENDER and subject == TARGET_SUBJECT
 
 
 def should_skip_email(msg, processed_state):
+    """Decide if email is older-or-equal to the last processed date (skip if so)."""
     email_date = normalize_datetime(msg.get("Date"))
     last_processed = processed_state.get("last_processed_date")
     if not email_date or not last_processed:
@@ -160,15 +224,24 @@ def should_skip_email(msg, processed_state):
     except ValueError:
         return False
 
+    # Compare using the message timezone when available
     return email_date <= last_processed_dt.astimezone(email_date.tzinfo or timezone.utc)
 
 
-def process_emails():
+# ---------- Main processing flow ----------
+def process_emails(dry_run=False):
+    """Main: search, validate, extract PDF attachments, save/upload, and move emails.
+
+    When dry_run=True the function will only print what it would do.
+    """
     mail = connect_gmail()
+    # Load persistent state (last_processed_date + processed_hashes)
     processed_state = load_processed_state()
-    seen_hashes = set()
+    # Use a set for quick lookups; start with persisted hashes
+    processed_hashes = set(processed_state.get("processed_hashes", []))
 
     try:
+        # Ensure Gmail label exists before moving messages
         ensure_gmail_home_loans_folder(mail)
 
         status, messages = mail.search(None, SEARCH_CRITERIA)
@@ -182,12 +255,16 @@ def process_emails():
 
         print(f"Found {len(email_ids)} HSBC email(s) matching the criteria.")
 
+        # Initialize Dropbox client only if token present and SDK available
         if DROPBOX_ACCESS_TOKEN and dropbox is not None:
             dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
         else:
             dbx = None
             os.makedirs(LOCAL_DEST_FOLDER, exist_ok=True)
             print(f"Saving HSBC PDF statements to: {LOCAL_DEST_FOLDER}")
+
+        # Track the most recent processed date seen in this run
+        newest_processed_dt = None
 
         for email_id in email_ids:
             _, msg_data = mail.fetch(email_id, "(RFC822)")
@@ -196,6 +273,7 @@ def process_emails():
                     continue
 
                 msg = message_from_bytes(response_part[1])
+                # Second-level validation to avoid false positives from SEARCH
                 if not is_expected_email(msg):
                     print(f"Skipping email not matching HSBC statement criteria: {msg.get('Subject')}")
                     continue
@@ -206,8 +284,10 @@ def process_emails():
 
                 saved_any = False
                 for part in msg.walk():
+                    # skip multipart container blocks
                     if part.get_content_maintype() == "multipart":
                         continue
+                    # require a Content-Disposition header for attachments
                     if part.get("Content-Disposition") is None:
                         continue
 
@@ -216,6 +296,7 @@ def process_emails():
                         continue
 
                     filename = decode_header_value(filename)
+                    # Only keep PDFs
                     if not filename.lower().endswith(".pdf"):
                         print(f"Skipping {filename} (not a PDF attachment)")
                         continue
@@ -225,27 +306,64 @@ def process_emails():
                         continue
 
                     if dbx is not None:
+                        # Dropbox mode: use permanent processed_hashes to avoid duplicates across runs
                         file_digest = file_hash(file_bytes)
-                        if file_digest in seen_hashes:
-                            print(f"Skipping duplicate HSBC statement: {filename}")
+                        if file_digest in processed_hashes:
+                            print(f"Skipping duplicate HSBC statement (already processed): {filename}")
                             continue
-                        seen_hashes.add(file_digest)
-                        dropbox_path = f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{filename}"
-                        print(f"Processing HSBC PDF attachment: {filename}")
-                        upload_to_dropbox(dbx, file_bytes, dropbox_path)
+
+                        # upload (or dry-run announce)
+                        success = upload_to_dropbox(dbx, file_bytes, f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{filename}", dry_run=dry_run)
+                        if success and not dry_run:
+                            processed_hashes.add(file_digest)
+                            saved_any = True
+                        elif success and dry_run:
+                            # in dry-run we treat as would-be saved
+                            saved_any = True
                     else:
-                        if save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER, seen_hashes):
+                        # Local save mode uses save_attachment_locally which records hashes
+                        if save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER, processed_hashes, dry_run=dry_run):
                             saved_any = True
 
-                if saved_any or dbx is not None:
-                    move_email_to_home_loans(mail, email_id)
-                    email_datetime = normalize_datetime(msg.get("Date"))
-                    if email_datetime:
-                        processed_state["last_processed_date"] = email_datetime.isoformat()
-                        save_processed_state(processed_state)
+                # If we saved or would have saved any file for this message, move/mark the email (unless dry-run)
+                if saved_any:
+                    if dry_run:
+                        print(f"[dry-run] Would move email {email_id.decode()} to '{GMAIL_HOMELOANS_FOLDER}' and mark as read.")
+                    else:
+                        move_email_to_home_loans(mail, email_id)
+
+                # Update newest processed date seen (use Date header when available)
+                email_datetime = normalize_datetime(msg.get("Date"))
+                if email_datetime:
+                    if newest_processed_dt is None or email_datetime > newest_processed_dt:
+                        newest_processed_dt = email_datetime
+
+        # Persist any new processed hashes and last_processed_date
+        if newest_processed_dt:
+            processed_state["last_processed_date"] = newest_processed_dt.isoformat()
+
+        # Convert processed_hashes set back to sorted list for deterministic state file
+        processed_state["processed_hashes"] = sorted(list(processed_hashes))
+
+        # Save state unless in dry-run
+        if not dry_run:
+            save_processed_state(processed_state)
+        else:
+            print("[dry-run] Processed state would be updated as follows:")
+            print(json.dumps(processed_state, indent=2))
+
     finally:
         mail.logout()
 
 
+# ---------- CLI Entrypoint ----------
+def main():
+    parser = argparse.ArgumentParser(description="Download HSBC PDF statements and save to Dropbox/local folder")
+    parser.add_argument("--dry-run", action="store_true", help="Preview actions without saving files, moving emails, or updating state")
+    args = parser.parse_args()
+
+    process_emails(dry_run=args.dry_run)
+
+
 if __name__ == "__main__":
-    process_emails()
+    main()
