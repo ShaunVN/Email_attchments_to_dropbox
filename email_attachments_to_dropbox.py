@@ -1,3 +1,4 @@
+import hashlib
 import imaplib
 import os
 from email import message_from_bytes
@@ -20,7 +21,7 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
 LOCAL_DEST_FOLDER = os.getenv(
     "LOCAL_DEST_FOLDER",
-    r"C:\Users\shaun\Dropbox\Personal\Home Buying\85_1 Mark St Lidcombe\HSBC\Loan statements",
+    r"C:\path\to\your\Dropbox\folder\HSBC\Loan statements",
 )
 DROPBOX_DEST_FOLDER = os.getenv("DROPBOX_DEST_FOLDER", "/Email_Attachments")
 SEARCH_CRITERIA = os.getenv(
@@ -54,6 +55,10 @@ def decode_header_value(value):
     return text
 
 
+def file_hash(file_bytes):
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
 def upload_to_dropbox(dbx, file_bytes, dropbox_path):
     """Upload byte content directly to Dropbox when configured."""
     if dropbox is None or ApiError is None:
@@ -66,7 +71,13 @@ def upload_to_dropbox(dbx, file_bytes, dropbox_path):
         print(f"Failed to upload {dropbox_path}: {err}")
 
 
-def save_attachment_locally(file_bytes, filename, target_folder):
+def save_attachment_locally(file_bytes, filename, target_folder, seen_hashes):
+    file_digest = file_hash(file_bytes)
+    if file_digest in seen_hashes:
+        print(f"Skipping duplicate HSBC statement: {filename}")
+        return
+
+    seen_hashes.add(file_digest)
     os.makedirs(target_folder, exist_ok=True)
     destination = os.path.join(target_folder, filename)
     with open(destination, "wb") as output_file:
@@ -82,6 +93,7 @@ def is_expected_email(msg):
 
 def process_emails():
     mail = connect_gmail()
+    seen_hashes = set()
 
     try:
         status, messages = mail.search(None, SEARCH_CRITERIA)
@@ -133,11 +145,16 @@ def process_emails():
                         continue
 
                     if dbx is not None:
+                        file_digest = file_hash(file_bytes)
+                        if file_digest in seen_hashes:
+                            print(f"Skipping duplicate HSBC statement: {filename}")
+                            continue
+                        seen_hashes.add(file_digest)
                         dropbox_path = f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{filename}"
                         print(f"Processing HSBC PDF attachment: {filename}")
                         upload_to_dropbox(dbx, file_bytes, dropbox_path)
                     else:
-                        save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER)
+                        save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER, seen_hashes)
     finally:
         mail.logout()
 
