@@ -97,10 +97,10 @@ def load_processed_state():
     The state JSON has the shape:
       {
         "last_processed_date": "<iso timestamp>" or "",
-        "processed_hashes": ["sha256hex", ...]
+        "processed_keys": ["filename_ddmmyyyy|size", ...]
       }
     """
-    default = {"last_processed_date": LAST_PROCESSED_DATE, "processed_hashes": []}
+    default = {"last_processed_date": LAST_PROCESSED_DATE, "processed_keys": []}
     if not os.path.exists(STATE_FILE):
         return default
 
@@ -112,7 +112,7 @@ def load_processed_state():
 
     # Ensure keys exist
     state.setdefault("last_processed_date", LAST_PROCESSED_DATE)
-    state.setdefault("processed_hashes", [])
+    state.setdefault("processed_keys", [])
     return state
 
 
@@ -199,22 +199,26 @@ def build_unique_filename(filename, email_date):
     return f"{stem}_{suffix}{extension}"
 
 
-def save_attachment_locally(file_bytes, filename, target_folder, processed_hashes, email_date=None, dry_run=False):
-    """Save attachment to local folder with a unique date-suffixed filename. Returns True if saved."""
-    file_digest = file_hash(file_bytes)
-    if file_digest in processed_hashes:
-        print(f"Skipping duplicate HSBC statement: {filename}")
+def save_attachment_locally(file_bytes, filename, target_folder, processed_keys, email_date=None, dry_run=False):
+    """Save attachment to local folder with a unique date-suffixed filename. Returns True if saved.
+
+    Uses processed_keys (persistent) to avoid saving the same filename+date+size multiple times.
+    """
+    unique_filename = build_unique_filename(filename, email_date)
+    # use size as additional simple discriminator
+    key = f"{unique_filename}|{len(file_bytes)}"
+    if key in processed_keys:
+        print(f"Skipping already-processed file (by filename+date+size): {unique_filename}")
         return False
 
-    unique_filename = build_unique_filename(filename, email_date)
     destination = os.path.join(target_folder, unique_filename)
 
     if dry_run:
         print(f"[dry-run] Would save: {destination}")
         return True
 
-    # Record the hash and write file
-    processed_hashes.add(file_digest)
+    # Record the key and write file
+    processed_keys.add(key)
     os.makedirs(target_folder, exist_ok=True)
     with open(destination, "wb") as output_file:
         output_file.write(file_bytes)
@@ -253,10 +257,10 @@ def process_emails(dry_run=False):
     When dry_run=True the function will only print what it would do.
     """
     mail = connect_gmail()
-    # Load persistent state (last_processed_date + processed_hashes)
+    # Load persistent state (last_processed_date + processed_keys)
     processed_state = load_processed_state()
-    # Use a set for quick lookups; start with persisted hashes
-    processed_hashes = set(processed_state.get("processed_hashes", []))
+    # Use a set for quick lookups; start with persisted keys
+    processed_keys = set(processed_state.get("processed_keys", []))
 
     try:
         # Ensure Gmail label exists before moving messages
@@ -331,24 +335,24 @@ def process_emails(dry_run=False):
                     unique_filename = build_unique_filename(filename, email_datetime)
 
                     if dbx is not None:
-                        # Dropbox mode: use permanent processed_hashes to avoid duplicates across runs
-                        file_digest = file_hash(file_bytes)
-                        if file_digest in processed_hashes:
-                            print(f"Skipping duplicate HSBC statement (already processed): {filename}")
-                            continue
+                    # Dropbox mode: use persistent processed_keys (based on filename+date+size) to avoid duplicates
+                    dropbox_target = f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{unique_filename}"
+                    key = f"{unique_filename}|{len(file_bytes)}"
+                    if key in processed_keys:
+                        print(f"Skipping already-processed file (by filename+date+size): {unique_filename}")
+                        continue
 
-                        dropbox_target = f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{unique_filename}"
                         # upload (or dry-run announce)
                         success = upload_to_dropbox(dbx, file_bytes, dropbox_target, dry_run=dry_run)
                         if success and not dry_run:
-                            processed_hashes.add(file_digest)
+                        processed_keys.add(key)
                             saved_any = True
                         elif success and dry_run:
                             # in dry-run we treat as would-be saved
                             saved_any = True
                     else:
-                        # Local save mode uses save_attachment_locally which records hashes
-                        if save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER, processed_hashes, email_date=email_datetime, dry_run=dry_run):
+                    # Local save mode uses save_attachment_locally which records processed_keys
+                    if save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER, processed_keys, email_date=email_datetime, dry_run=dry_run):
                             saved_any = True
 
                 # If we saved or would have saved any file for this message, move/mark the email (unless dry-run)
@@ -364,12 +368,12 @@ def process_emails(dry_run=False):
                     if newest_processed_dt is None or email_datetime > newest_processed_dt:
                         newest_processed_dt = email_datetime
 
-        # Persist any new processed hashes and last_processed_date
+        # Persist any new processed keys and last_processed_date
         if newest_processed_dt:
             processed_state["last_processed_date"] = newest_processed_dt.isoformat()
 
-        # Convert processed_hashes set back to sorted list for deterministic state file
-        processed_state["processed_hashes"] = sorted(list(processed_hashes))
+        # Convert processed_keys set back to sorted list for deterministic state file
+        processed_state["processed_keys"] = sorted(list(processed_keys))
 
         # Save state unless in dry-run
         if not dry_run:
