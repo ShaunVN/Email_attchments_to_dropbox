@@ -186,21 +186,36 @@ def upload_to_dropbox(dbx, file_bytes, dropbox_path, dry_run=False):
         return False
 
 
-def save_attachment_locally(file_bytes, filename, target_folder, processed_hashes, dry_run=False):
-    """Save attachment to local folder if not duplicate. Returns True if saved."""
+def build_unique_filename(filename, email_date):
+    """Return filename with a date suffix inserted before the extension.
+
+    Example: statement.pdf + 2026-09-05 => statement_05092026.pdf
+    """
+    stem, extension = os.path.splitext(filename)
+    if not email_date:
+        return filename
+
+    suffix = email_date.strftime("%d%m%Y")
+    return f"{stem}_{suffix}{extension}"
+
+
+def save_attachment_locally(file_bytes, filename, target_folder, processed_hashes, email_date=None, dry_run=False):
+    """Save attachment to local folder with a unique date-suffixed filename. Returns True if saved."""
     file_digest = file_hash(file_bytes)
     if file_digest in processed_hashes:
         print(f"Skipping duplicate HSBC statement: {filename}")
         return False
 
+    unique_filename = build_unique_filename(filename, email_date)
+    destination = os.path.join(target_folder, unique_filename)
+
     if dry_run:
-        print(f"[dry-run] Would save: {os.path.join(target_folder, filename)}")
+        print(f"[dry-run] Would save: {destination}")
         return True
 
     # Record the hash and write file
     processed_hashes.add(file_digest)
     os.makedirs(target_folder, exist_ok=True)
-    destination = os.path.join(target_folder, filename)
     with open(destination, "wb") as output_file:
         output_file.write(file_bytes)
     print(f"Saved attachment: {destination}")
@@ -312,6 +327,9 @@ def process_emails(dry_run=False):
                     if file_bytes is None:
                         continue
 
+                    email_datetime = normalize_datetime(msg.get("Date"))
+                    unique_filename = build_unique_filename(filename, email_datetime)
+
                     if dbx is not None:
                         # Dropbox mode: use permanent processed_hashes to avoid duplicates across runs
                         file_digest = file_hash(file_bytes)
@@ -319,8 +337,9 @@ def process_emails(dry_run=False):
                             print(f"Skipping duplicate HSBC statement (already processed): {filename}")
                             continue
 
+                        dropbox_target = f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{unique_filename}"
                         # upload (or dry-run announce)
-                        success = upload_to_dropbox(dbx, file_bytes, f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{filename}", dry_run=dry_run)
+                        success = upload_to_dropbox(dbx, file_bytes, dropbox_target, dry_run=dry_run)
                         if success and not dry_run:
                             processed_hashes.add(file_digest)
                             saved_any = True
@@ -329,7 +348,7 @@ def process_emails(dry_run=False):
                             saved_any = True
                     else:
                         # Local save mode uses save_attachment_locally which records hashes
-                        if save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER, processed_hashes, dry_run=dry_run):
+                        if save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER, processed_hashes, email_date=email_datetime, dry_run=dry_run):
                             saved_any = True
 
                 # If we saved or would have saved any file for this message, move/mark the email (unless dry-run)
