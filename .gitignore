@@ -7,4 +7,7 @@ venv/
 .env
 .env.*
 !.env.example
+processed_statements.json
+hsbc_statement_log.txt
+*.log
 .DS_Store

@@ -10,6 +10,7 @@ load_dotenv()
 
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+LOG_FILE = os.getenv("LOG_FILE", "hsbc_statement_log.txt")
 SEARCH_CRITERIA = os.getenv(
     "SEARCH_CRITERIA",
     'FROM "HSBC@connect.hsbc.com.au" SUBJECT "Your Monthly HSBC Bank Statement" UNSEEN',
@@ -75,6 +76,17 @@ def print_match_details(email_id, msg):
     print("-" * 80)
 
 
+def log_event(message):
+    timestamp = __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as log_handle:
+            log_handle.write(line + "\n")
+    except OSError:
+        pass
+
+
 def main():
     mail = connect_gmail()
     try:
@@ -84,10 +96,10 @@ def main():
 
         email_ids = messages[0].split()
         if not email_ids:
-            print("No HSBC matching emails found.")
+            log_event("No HSBC matching emails found.")
             return
 
-        print(f"Found {len(email_ids)} potential HSBC email(s). Safe mode: no attachments will be saved, moved, or marked as read.")
+        log_event(f"Found {len(email_ids)} potential HSBC email(s). Safe mode: no attachments will be saved, moved, or marked as read.")
 
         for email_id in email_ids:
             _, msg_data = mail.fetch(email_id, "(RFC822)")
@@ -100,6 +112,7 @@ def main():
                     continue
 
                 print_match_details(email_id, msg)
+                log_event(f"MATCH -> email {email_id.decode()} matched HSBC statement criteria")
     finally:
         mail.logout()
 

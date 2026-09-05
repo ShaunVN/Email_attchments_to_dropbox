@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from email import message_from_bytes
 from email.header import decode_header
 from email.utils import parsedate_to_datetime, parseaddr
+from io import BytesIO
 
 from dotenv import load_dotenv
 
@@ -26,6 +27,12 @@ try:
 except ImportError:  # pragma: no cover
     dropbox = None
     ApiError = None
+
+try:
+    from pypdf import PdfReader, PdfWriter
+except ImportError:  # pragma: no cover
+    PdfReader = None
+    PdfWriter = None
 
 load_dotenv()
 
@@ -46,6 +53,10 @@ LAST_PROCESSED_DATE = os.getenv("LAST_PROCESSED_DATE", "")
 STATE_FILE = os.getenv("STATE_FILE", "processed_statements.json")
 # By default uploads are disabled to avoid sandboxed App-folder behavior; set UPLOAD_TO_DROPBOX=true to enable uploading
 UPLOAD_TO_DROPBOX = os.getenv("UPLOAD_TO_DROPBOX", "false").lower() in ("1", "true", "yes")
+# Optional PDF password used to decrypt encrypted statements before saving/opening them.
+PDF_PASSWORD = os.getenv("PDF_PASSWORD", "")
+PDF_DECRYPT_ENABLED = os.getenv("PDF_DECRYPT_ENABLED", "false").lower() in ("1", "true", "yes")
+LOG_FILE = os.getenv("LOG_FILE", "hsbc_statement_log.txt")
 SEARCH_CRITERIA = os.getenv(
     "SEARCH_CRITERIA",
     'FROM "HSBC@connect.hsbc.com.au" SUBJECT "Your Monthly HSBC Bank Statement" UNSEEN',
@@ -127,6 +138,44 @@ def file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
 
+def write_log(message):
+    """Append a timestamped message to the main runtime log file and print it."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as log_handle:
+            log_handle.write(line + "\n")
+    except OSError:
+        # Keep the main flow running even if the log file cannot be written.
+        pass
+
+
+def decrypt_pdf_bytes(file_bytes, password=None):
+    """Return decrypted PDF bytes when the file is encrypted and a password is provided."""
+    if not password or not PDF_DECRYPT_ENABLED or PdfReader is None or PdfWriter is None:
+        return file_bytes, False, "not-decrypted"
+
+    try:
+        reader = PdfReader(BytesIO(file_bytes))
+        if not reader.is_encrypted:
+            return file_bytes, False, "not-encrypted"
+
+        decrypt_result = reader.decrypt(password)
+        if decrypt_result == 0:
+            return file_bytes, False, "decrypt-failed"
+
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+
+        output = BytesIO()
+        writer.write(output)
+        return output.getvalue(), True, "decrypted"
+    except Exception as exc:
+        return file_bytes, False, f"decrypt-error:{exc}"
+
+
 # ---------- Gmail label/folder management helpers ----------
 def ensure_gmail_home_loans_folder(mail):
     """Ensure the HomeLoans label/folder exists in the account; create if missing."""
@@ -170,19 +219,19 @@ def move_email_to_home_loans(mail, email_id):
 def upload_to_dropbox(dbx, file_bytes, dropbox_path, dry_run=False):
     """Upload byte content directly to Dropbox when configured. In dry-run, only print."""
     if dry_run:
-        print(f"[dry-run] Would upload to Dropbox: {dropbox_path}")
+        write_log(f"[dry-run] Would upload to Dropbox: {dropbox_path}")
         return True
 
     if dropbox is None or ApiError is None:
-        print("Dropbox SDK not available; skipping upload.")
+        write_log("Dropbox SDK not available; skipping upload.")
         return False
 
     try:
         dbx.files_upload(file_bytes, dropbox_path, mode=dropbox.files.WriteMode.overwrite)
-        print(f"Successfully uploaded: {dropbox_path}")
+        write_log(f"Successfully uploaded: {dropbox_path}")
         return True
     except ApiError as err:
-        print(f"Failed to upload {dropbox_path}: {err}")
+        write_log(f"Failed to upload {dropbox_path}: {err}")
         return False
 
 
@@ -208,21 +257,30 @@ def save_attachment_locally(file_bytes, filename, target_folder, processed_keys,
     # use size as additional simple discriminator
     key = f"{unique_filename}|{len(file_bytes)}"
     if key in processed_keys:
-        print(f"Skipping already-processed file (by filename+date+size): {unique_filename}")
+        write_log(f"SKIPPED -> already-processed file (by filename+date+size): {unique_filename}")
         return False
 
     destination = os.path.join(target_folder, unique_filename)
 
     if dry_run:
-        print(f"[dry-run] Would save: {destination}")
+        write_log(f"[dry-run] SAVE -> {destination}")
         return True
 
-    # Record the key and write file
+    # Optional password-based decryption for encrypted PDFs if user specifies a password
+    if PDF_DECRYPT_ENABLED and PDF_PASSWORD:
+        decrypted_bytes, decrypted, decrypt_status = decrypt_pdf_bytes(file_bytes, PDF_PASSWORD)
+        if decrypted:
+            file_bytes = decrypted_bytes
+            write_log(f"DECRYPTED -> {unique_filename} ({decrypt_status})")
+        else:
+            write_log(f"DECRYPTION-FAILED -> {unique_filename} ({decrypt_status})")
+            # If decrypt failed, keep original bytes so we still try to save the file.
+
     processed_keys.add(key)
     os.makedirs(target_folder, exist_ok=True)
     with open(destination, "wb") as output_file:
         output_file.write(file_bytes)
-    print(f"Saved attachment: {destination}")
+    write_log(f"SAVED -> {destination}")
     return True
 
 
@@ -301,11 +359,11 @@ def process_emails(dry_run=False):
                 msg = message_from_bytes(response_part[1])
                 # Second-level validation to avoid false positives from SEARCH
                 if not is_expected_email(msg):
-                    print(f"Skipping email not matching HSBC statement criteria: {msg.get('Subject')}")
+                    write_log(f"SKIPPED -> email not matching HSBC criteria: {msg.get('Subject')}")
                     continue
 
                 if should_skip_email(msg, processed_state):
-                    print(f"Skipping email older than last processed date: {msg.get('Subject')}")
+                    write_log(f"SKIPPED -> email older than last processed date: {msg.get('Subject')}")
                     continue
 
                 saved_any = False
@@ -324,11 +382,12 @@ def process_emails(dry_run=False):
                     filename = decode_header_value(filename)
                     # Only keep PDFs
                     if not filename.lower().endswith(".pdf"):
-                        print(f"Skipping {filename} (not a PDF attachment)")
+                        write_log(f"SKIPPED -> {filename} (not a PDF attachment)")
                         continue
 
                     file_bytes = part.get_payload(decode=True)
                     if file_bytes is None:
+                        write_log(f"SKIPPED -> {filename} (attachment content empty)")
                         continue
 
                     email_datetime = normalize_datetime(msg.get("Date"))
@@ -339,7 +398,7 @@ def process_emails(dry_run=False):
                         dropbox_target = f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{unique_filename}"
                         key = f"{unique_filename}|{len(file_bytes)}"
                         if key in processed_keys:
-                            print(f"Skipping already-processed file (by filename+date+size): {unique_filename}")
+                            write_log(f"SKIPPED -> already-processed file (by filename+date+size): {unique_filename}")
                             continue
 
                         # upload (or dry-run announce)
