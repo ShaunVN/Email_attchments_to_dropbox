@@ -335,24 +335,24 @@ def process_emails(dry_run=False):
                     unique_filename = build_unique_filename(filename, email_datetime)
 
                     if dbx is not None:
-                    # Dropbox mode: use persistent processed_keys (based on filename+date+size) to avoid duplicates
-                    dropbox_target = f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{unique_filename}"
-                    key = f"{unique_filename}|{len(file_bytes)}"
-                    if key in processed_keys:
-                        print(f"Skipping already-processed file (by filename+date+size): {unique_filename}")
-                        continue
+                        # Dropbox mode: use persistent processed_keys (based on filename+date+size) to avoid duplicates
+                        dropbox_target = f"{DROPBOX_DEST_FOLDER.rstrip('/')}/{unique_filename}"
+                        key = f"{unique_filename}|{len(file_bytes)}"
+                        if key in processed_keys:
+                            print(f"Skipping already-processed file (by filename+date+size): {unique_filename}")
+                            continue
 
                         # upload (or dry-run announce)
                         success = upload_to_dropbox(dbx, file_bytes, dropbox_target, dry_run=dry_run)
                         if success and not dry_run:
-                        processed_keys.add(key)
+                            processed_keys.add(key)
                             saved_any = True
                         elif success and dry_run:
                             # in dry-run we treat as would-be saved
                             saved_any = True
                     else:
-                    # Local save mode uses save_attachment_locally which records processed_keys
-                    if save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER, processed_keys, email_date=email_datetime, dry_run=dry_run):
+                        # Local save mode uses save_attachment_locally which records processed_keys
+                        if save_attachment_locally(file_bytes, filename, LOCAL_DEST_FOLDER, processed_keys, email_date=email_datetime, dry_run=dry_run):
                             saved_any = True
 
                 # If we saved or would have saved any file for this message, move/mark the email (unless dry-run)
