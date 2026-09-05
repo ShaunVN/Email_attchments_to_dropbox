@@ -33,6 +33,7 @@ load_dotenv()
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
+# LOCAL_DEST_FOLDER is the local Dropbox-synced path where attachments will be saved when not uploading
 LOCAL_DEST_FOLDER = os.getenv(
     "LOCAL_DEST_FOLDER",
     r"C:\path\to\your\Dropbox\folder\HSBC\Loan statements",
@@ -43,6 +44,8 @@ GMAIL_HOMELOANS_FOLDER = os.getenv("GMAIL_HOMELOANS_FOLDER", "HomeLoans")
 LAST_PROCESSED_DATE = os.getenv("LAST_PROCESSED_DATE", "")
 # STATE_FILE stores JSON with 'last_processed_date' and 'processed_hashes' list
 STATE_FILE = os.getenv("STATE_FILE", "processed_statements.json")
+# By default uploads are disabled to avoid sandboxed App-folder behavior; set UPLOAD_TO_DROPBOX=true to enable uploading
+UPLOAD_TO_DROPBOX = os.getenv("UPLOAD_TO_DROPBOX", "false").lower() in ("1", "true", "yes")
 SEARCH_CRITERIA = os.getenv(
     "SEARCH_CRITERIA",
     'FROM "HSBC@connect.hsbc.com.au" SUBJECT "Your Monthly HSBC Bank Statement" UNSEEN',
@@ -255,13 +258,17 @@ def process_emails(dry_run=False):
 
         print(f"Found {len(email_ids)} HSBC email(s) matching the criteria.")
 
-        # Initialize Dropbox client only if token present and SDK available
-        if DROPBOX_ACCESS_TOKEN and dropbox is not None:
+        # Initialize Dropbox client only when explicitly enabled via UPLOAD_TO_DROPBOX and when SDK/token are available
+        if UPLOAD_TO_DROPBOX and DROPBOX_ACCESS_TOKEN and dropbox is not None:
             dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+            print("Dropbox upload enabled — files will be uploaded to Dropbox paths under: ", DROPBOX_DEST_FOLDER)
+            # Note: if your Dropbox app uses App folder access, uploads go under Dropbox/Apps/<AppName>/...
         else:
             dbx = None
             os.makedirs(LOCAL_DEST_FOLDER, exist_ok=True)
-            print(f"Saving HSBC PDF statements to: {LOCAL_DEST_FOLDER}")
+            print(f"Local-save mode active. Saving HSBC PDF statements to: {LOCAL_DEST_FOLDER}")
+            if DROPBOX_ACCESS_TOKEN and not UPLOAD_TO_DROPBOX:
+                print("DROPBOX_ACCESS_TOKEN is present but UPLOAD_TO_DROPBOX is false — uploads are disabled by configuration.")
 
         # Track the most recent processed date seen in this run
         newest_processed_dt = None
